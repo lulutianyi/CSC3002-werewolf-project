@@ -1,0 +1,679 @@
+#define _WIN32_WINNT 0x0600
+#define WIN32_LEAN_AND_MEAN
+#include <iostream>
+#include <string>
+#include <thread>
+#include <vector>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <map>
+#pragma comment(lib, "ws2_32.lib")
+#include <windows.h>
+#include "GameController.h"
+#include "GameTypes.h"
+using namespace WerewolfGame;
+using namespace std;
+
+struct ClientUsers{
+    string name = "NewUser";   // 用户名
+    string role = "monitor";  // "client" 或 "monitor"
+    string owner = "";        // 绑定的 client 名字
+    SOCKET skt;
+};
+
+vector<ClientUsers> clients;
+
+// 全局游戏控制器实例
+GameController game;
+bool game_initialized = false;
+
+// ✅ 新增：玩家ID与Client用户名的映射
+map<int, string> player_id_to_client_name;  // 1 -> "张三#1234", 2 -> "李四#5678"
+
+// 游戏状态枚举
+enum class GameState {
+    WAITING_FOR_PLAYERS,    // 等待玩家加入
+    GAME_START,             // 游戏开始，分配角色
+    NIGHT_WEREWOLF,         // 夜晚-狼人行动
+    NIGHT_SEER,             // 夜晚-预言家行动
+    NIGHT_WITCH,            // 夜晚-女巫行动
+    NIGHT_RESOLVE,          // 夜晚-结算
+    DAY_HUNTER_SHOOT,       // 白天-猎人开枪（如果猎人昨晚死亡）
+    DAY_LAST_WORDS,         // 白天-遗言（如果有人死亡）
+    DAY_DISCUSSION,         // 白天-自由发言讨论
+    DAY_VOTING,             // 白天-投票放逐
+    VOTE_RESOLVE,           // 投票结算
+    GAME_OVER               // 游戏结束
+};
+
+GameState current_game_state = GameState::WAITING_FOR_PLAYERS;
+
+// 临时数据存储
+std::map<int, int> werewolf_votes;      // 狼人的投票 <狼人ID, 目标ID>
+std::map<int, int> player_day_votes;    // 白天投票 <玩家ID, 目标ID>
+int night_dead_player = -1;             // 昨晚死亡的玩家ID
+bool hunter_needs_shoot = false;        // 猎人是否需要开枪
+
+// ✅ 只发送给“指定 client 对应的 monitor”
+void send_to_own_monitor(const string& ownerName,const string& msg){
+    for (auto &c : clients){
+        if (c.role == "monitor" && c.owner == ownerName){
+            send(c.skt,msg.c_str(),msg.size(),0);
+        }
+    }
+}
+
+// ✅ 示例：server 可指定发给某个人
+void send_to_target_monitor(const string& target,const string& msg){
+    for (auto &c : clients){
+        if (c.role == "monitor" && c.owner == target){
+            send(c.skt,msg.c_str(),msg.size(),0);
+        }
+    }
+}
+
+// 公共广播
+void broadcast_to_all_monitors(const string& msg){
+    for (auto &c : clients){
+        if (c.role == "monitor"){
+            send(c.skt,msg.c_str(),msg.size(),0);
+        }
+    }
+}
+
+// 辅助函数：发送消息给特定玩家的 monitor
+void send_to_player(int player_id, const string& msg) {
+    // ✅ 使用映射表找到真实的client用户名
+    if (player_id_to_client_name.find(player_id) != player_id_to_client_name.end()) {
+        string client_name = player_id_to_client_name[player_id];
+        string message = msg + "\n";
+        send_to_own_monitor(client_name, message);
+    }
+}
+
+// 辅助函数：从特定玩家的 client 接收消息（阻塞式）
+int receive_choice_from_player(int player_id) {
+    // ✅ 使用映射表找到真实的client用户名
+    if (player_id_to_client_name.find(player_id) == player_id_to_client_name.end()) {
+        return -1;
+    }
+    
+    string client_name = player_id_to_client_name[player_id];
+    
+    // 找到对应的 client socket
+    for (auto& client : clients) {
+        if (client.role == "client" && client.name == client_name) {
+            char buffer[1024];
+            memset(buffer, 0, sizeof(buffer));
+            int bytes = recv(client.skt, buffer, sizeof(buffer), 0);
+            if (bytes > 0) {
+                string input(buffer, bytes);
+                input.erase(remove(input.begin(), input.end(), '\n'), input.end());
+                input.erase(remove(input.begin(), input.end(), '\r'), input.end());
+                try {
+                    return stoi(input);
+                } catch (...) {
+                    return -1;
+                }
+            }
+            break;
+        }
+    }
+    return -1;
+}
+
+// 辅助函数：根据玩家ID查找ClientUsers索引
+int find_client_index(int player_id) {
+    string player_name = "Player" + to_string(player_id);
+    for (size_t i = 0; i < clients.size(); ++i) {
+        if (clients[i].role == "client" && clients[i].name == player_name) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void handle_client(SOCKET clskt,int VecId){
+    char buffer[1024];
+    while (true){
+        int bytes = recv(clskt,buffer,sizeof(buffer),0);
+        if (bytes <= 0){
+            closesocket(clskt);
+            break;
+        }
+
+        string msg(buffer,bytes);
+
+        // ✅ client 注册身份
+        if (msg.substr(0,22) == "///User_Create:Name = "){
+            clients[VecId].name = msg.substr(22);
+            clients[VecId].role = "client";
+            clients[VecId].owner = clients[VecId].name;
+
+            cout << "[client上线] " << clients[VecId].name << endl;
+            continue;
+        }
+
+        // ✅ monitor 标记
+        if (msg == "///Monitor"){
+            clients[VecId].role = "monitor";
+            cout << "[monitor连接]\n";
+            continue;
+        }
+
+        // ✅ monitor 绑定 client
+        if (msg.substr(0,8) == "///Bind:"){
+            clients[VecId].owner = msg.substr(8);
+            cout << "[monitor绑定] -> " << clients[VecId].owner << endl;
+            continue;
+        }
+
+        // ✅ 测试：server 指令只发给某个人的 monitor
+        if (msg.substr(0,6) == "/send "){
+            int p = msg.find(' ',6);
+            if (p != string::npos){
+                string target = msg.substr(6,p-6);
+                string content = msg.substr(p+1);
+                send_to_target_monitor(target,"[SERVER] "+content);
+            }
+            continue;
+        }
+
+        // ✅ 正常 client 消息能发送给所有的 monitor
+        if (clients[VecId].role == "client"){
+            string out = clients[VecId].name + ": " + msg;
+            broadcast_to_all_monitors(out);
+            cout << "[公共消息] " << out << endl;
+        }
+    }
+}
+
+// ============================================
+// 游戏流程状态机主循环
+// 此函数应该在一个独立线程中运行
+// ============================================
+void game_state_machine() {
+    while (true) {
+        switch (current_game_state) {
+            
+            // ========== 等待玩家加入 ==========
+            case GameState::WAITING_FOR_PLAYERS: {
+                // 统计已连接的 client 数量
+                int client_count = 0;
+                for (auto& c : clients) {
+                    if (c.role == "client") {
+                        client_count++;
+                    }
+                }
+                
+                // 等待至少6人
+                if (client_count >= 2) {
+                    broadcast_to_all_monitors("玩家人数已足够，游戏即将开始！\n");
+                    current_game_state = GameState::GAME_START;
+                } else {
+                    Sleep(1000);  // 等待1秒
+                }
+                break;
+            }
+            
+            // ========== 游戏开始，分配角色 ==========
+            case GameState::GAME_START: {
+                broadcast_to_all_monitors("=== 游戏开始，正在分配角色 ===\n");
+                
+                // ✅ 收集所有client并建立ID映射
+                vector<string> player_names;
+                player_id_to_client_name.clear();
+                int player_id = 1;
+                
+                for (auto& client : clients) {
+                    if (client.role == "client") {
+                        player_names.push_back(client.name);
+                        player_id_to_client_name[player_id] = client.name;  // 建立映射
+                        player_id++;
+                    }
+                }
+                
+                game.initializeGame(player_names.size(), player_names);
+                game_initialized = true;
+                
+                // ✅ 通知每个玩家他们的角色
+                for (int pid = 1; pid <= player_names.size(); pid++) {
+                    const auto& player = game.getPlayer(pid);
+                    string role_name;
+                    switch (player.role) {
+                        case RoleType::WEREWOLF: role_name = "狼人"; break;
+                        case RoleType::SEER: role_name = "预言家"; break;
+                        case RoleType::WITCH: role_name = "女巫"; break;
+                        case RoleType::HUNTER: role_name = "猎人"; break;
+                        case RoleType::VILLAGER: role_name = "平民"; break;
+                    }
+                    string msg = "你的游戏ID是" + to_string(pid) + "，角色是: " + role_name + "\n";
+                    send_to_player(pid, msg);
+                }
+                
+                broadcast_to_all_monitors("角色分配完成，游戏开始！\n");
+                Sleep(2000);
+                current_game_state = GameState::NIGHT_WEREWOLF;
+                break;
+            }
+            
+            // ========== 夜晚-狼人行动 ==========
+            case GameState::NIGHT_WEREWOLF: {
+                broadcast_to_all_monitors("=== 夜晚降临 ===\n");
+                broadcast_to_all_monitors("天黑请闭眼...\n");
+                Sleep(2000);
+                
+                broadcast_to_all_monitors("狼人请睁眼，狼人请选择击杀目标\n");
+                werewolf_votes.clear();
+                
+                // 获取所有存活的狼人
+                auto alive_players = game.getAlivePlayers();
+                for (int player_id : alive_players) {
+                    const auto& player = game.getPlayer(player_id);
+                    if (player.role == RoleType::WEREWOLF) {
+                        // 发送提示给这个狼人
+                        string prompt = "请选择你要击杀的目标玩家ID (";
+                        for (int target_id : alive_players) {
+                            if (target_id != player_id) {
+                                prompt += to_string(target_id) + " ";
+                            }
+                        }
+                        prompt += "): ";
+                        send_to_player(player_id, prompt);
+                        
+                        // 等待狼人选择
+                        int choice = receive_choice_from_player(player_id);
+                        if (choice > 0 && game.isPlayerAlive(choice)) {
+                            werewolf_votes[player_id] = choice;
+                            broadcast_to_all_monitors("狼人" + to_string(player_id) + "已做出选择\n");
+                        }
+                    }
+                }
+                
+                // 统计狼人投票，选择票数最多的目标
+                if (!werewolf_votes.empty()) {
+                    map<int, int> vote_count;
+                    for (auto& vote : werewolf_votes) {
+                        vote_count[vote.second]++;
+                    }
+                    int max_votes = 0;
+                    int target = -1;
+                    for (auto& vc : vote_count) {
+                        if (vc.second > max_votes) {
+                            max_votes = vc.second;
+                            target = vc.first;
+                        }
+                    }
+                    game.setWerewolfTarget(target);
+                    broadcast_to_all_monitors("狼人已选择目标\n");
+                }
+                
+                Sleep(2000);
+                current_game_state = GameState::NIGHT_SEER;
+                break;
+            }
+            
+            // ========== 夜晚-预言家行动 ==========
+            case GameState::NIGHT_SEER: {
+                broadcast_to_all_monitors("预言家请睁眼，预言家请选择查验目标");
+                
+                auto alive_players = game.getAlivePlayers();
+                for (int player_id : alive_players) {
+                    const auto& player = game.getPlayer(player_id);
+                    if (player.role == RoleType::SEER) {
+                        // 发送提示给预言家
+                        string prompt = "请选择你要查验的玩家ID (";
+                        for (int target_id : alive_players) {
+                            if (target_id != player_id && !game.hasPlayerBeenChecked(target_id)) {
+                                prompt += to_string(target_id) + " ";
+                            }
+                        }
+                        prompt += "): ";
+                        send_to_player(player_id, prompt);
+                        
+                        // 等待预言家选择
+                        int choice = receive_choice_from_player(player_id);
+                        if (choice > 0 && game.isPlayerAlive(choice)) {
+                            game.performSeerCheck(player_id, choice);
+                            
+                            // 告知预言家查验结果
+                            const auto& target = game.getPlayer(choice);
+                            string result = "玩家" + to_string(choice) + "的身份是: ";
+                            result += (target.role == RoleType::WEREWOLF) ? "狼人" : "好人";
+                            send_to_player(player_id, result);
+                        }
+                        break;
+                    }
+                }
+                
+                Sleep(2000);
+                current_game_state = GameState::NIGHT_WITCH;
+                break;
+            }
+            
+            // ========== 夜晚-女巫行动 ==========
+            case GameState::NIGHT_WITCH: {
+                broadcast_to_all_monitors("女巫请睁眼");
+                
+                auto alive_players = game.getAlivePlayers();
+                for (int player_id : alive_players) {
+                    const auto& player = game.getPlayer(player_id);
+                    if (player.role == RoleType::WITCH) {
+                        int werewolf_target = game.getWerewolfTarget();
+                        
+                        // 解药选择
+                        if (!game.isAntidoteUsed() && werewolf_target != -1) {
+                            string msg = "今晚" + to_string(werewolf_target) + "号玩家被狼人攻击，";
+                            msg += "你是否使用解药救他？(1=是, 0=否): ";
+                            send_to_player(player_id, msg);
+                            
+                            int choice = receive_choice_from_player(player_id);
+                            if (choice == 1) {
+                                game.useAntidote(werewolf_target);
+                                send_to_player(player_id, "你使用了解药");
+                            }
+                        }
+                        
+                        // 毒药选择
+                        if (!game.isPoisonUsed()) {
+                            string prompt = "你是否使用毒药？(1=是, 0=否): ";
+                            send_to_player(player_id, prompt);
+                            
+                            int use_poison = receive_choice_from_player(player_id);
+                            if (use_poison == 1) {
+                                string prompt2 = "请选择要毒杀的玩家ID (";
+                                for (int target_id : alive_players) {
+                                    prompt2 += to_string(target_id) + " ";
+                                }
+                                prompt2 += "): ";
+                                send_to_player(player_id, prompt2);
+                                
+                                int poison_target = receive_choice_from_player(player_id);
+                                if (poison_target > 0 && game.isPlayerAlive(poison_target)) {
+                                    game.usePoison(poison_target);
+                                    send_to_player(player_id, "你使用了毒药");
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                
+                Sleep(2000);
+                current_game_state = GameState::NIGHT_RESOLVE;
+                break;
+            }
+            
+            // ========== 夜晚结算 ==========
+            case GameState::NIGHT_RESOLVE: {
+                broadcast_to_all_monitors("天亮了...");
+                Sleep(2000);
+                
+                // 获取夜晚行动的目标
+                int werewolf_target = game.getWerewolfTarget();
+                int healed_player = game.getHealedPlayer();
+                int poisoned_player = game.getPoisonedPlayer();
+                
+                // 记录死亡玩家
+                vector<int> dead_players;
+                int hunter_death_by_werewolf = -1;  // 只有被狼杀的猎人才能开枪
+                
+                // 1. 处理狼人击杀（未被救）
+                if (werewolf_target != -1 && werewolf_target != healed_player) {
+                    game.eliminatePlayer(werewolf_target);
+                    dead_players.push_back(werewolf_target);
+                    
+                    // 检查是否是猎人（只有被狼杀的猎人能开枪）
+                    const auto& player = game.getPlayer(werewolf_target);
+                    if (player.role == RoleType::HUNTER) {
+                        hunter_death_by_werewolf = werewolf_target;
+                    }
+                    
+                    broadcast_to_all_monitors("昨晚" + to_string(werewolf_target) + "号玩家被狼人杀害");
+                }
+                
+                // 2. 处理女巫毒杀（被毒的猎人不能开枪）
+                if (poisoned_player != -1) {
+                    game.eliminatePlayer(poisoned_player);
+                    dead_players.push_back(poisoned_player);
+                    broadcast_to_all_monitors("昨晚" + to_string(poisoned_player) + "号玩家被毒杀");
+                }
+                
+                // 3. 如果没人死亡
+                if (dead_players.empty()) {
+                    broadcast_to_all_monitors("昨晚是平安夜，无人死亡");
+                }
+                
+                // 4. 设置猎人开枪状态
+                if (hunter_death_by_werewolf != -1) {
+                    hunter_needs_shoot = true;
+                    night_dead_player = hunter_death_by_werewolf;
+                } else if (!dead_players.empty()) {
+                    night_dead_player = dead_players[0];  // 用于遗言
+                } else {
+                    night_dead_player = -1;
+                }
+                
+                // 5. 检查游戏是否结束
+                game.checkGameOver();
+                
+                // 6. 决定下一个状态
+                if (game.isGameOver()) {
+                    current_game_state = GameState::GAME_OVER;
+                } else if (hunter_needs_shoot) {
+                    current_game_state = GameState::DAY_HUNTER_SHOOT;
+                } else if (night_dead_player != -1) {
+                    current_game_state = GameState::DAY_LAST_WORDS;
+                } else {
+                    current_game_state = GameState::DAY_DISCUSSION;
+                }
+                break;
+            }
+            
+            // ========== 白天-猎人开枪 ==========
+            case GameState::DAY_HUNTER_SHOOT: {
+                broadcast_to_all_monitors("猎人触发技能，可以开枪带走一名玩家");
+                
+                // 找到死亡的猎人
+                const auto& hunter = game.getPlayer(night_dead_player);
+                string prompt = "猎人，请选择你要带走的玩家ID (";
+                auto alive_players = game.getAlivePlayers();
+                for (int target_id : alive_players) {
+                    prompt += to_string(target_id) + " ";
+                }
+                prompt += "): ";
+                send_to_player(night_dead_player, prompt);
+                
+                int shoot_target = receive_choice_from_player(night_dead_player);
+                if (shoot_target > 0 && game.isPlayerAlive(shoot_target)) {
+                    game.eliminatePlayer(shoot_target);
+                    broadcast_to_all_monitors("猎人开枪带走了" + to_string(shoot_target) + "号玩家");
+                }
+                
+                hunter_needs_shoot = false;
+                
+                // 再次检查游戏是否结束
+                if (game.isGameOver()) {
+                    current_game_state = GameState::GAME_OVER;
+                } else if (night_dead_player != -1) {
+                    current_game_state = GameState::DAY_LAST_WORDS;
+                } else {
+                    current_game_state = GameState::DAY_DISCUSSION;
+                }
+                break;
+            }
+            
+            // ========== 白天-遗言 ==========
+            case GameState::DAY_LAST_WORDS: {
+                if (night_dead_player != -1) {
+                    broadcast_to_all_monitors("昨晚" + to_string(night_dead_player) + "号玩家死亡，请留遗言");
+                    send_to_player(night_dead_player, "请输入你的遗言: ");
+                    
+                    // 这里可以等待遗言输入，暂时跳过
+                    Sleep(5000);  // 给5秒时间留遗言
+                }
+                
+                current_game_state = GameState::DAY_DISCUSSION;
+                break;
+            }
+            
+            // ========== 白天-自由发言讨论 ==========
+            case GameState::DAY_DISCUSSION: {
+                broadcast_to_all_monitors("=== 白天讨论阶段 ===");
+                broadcast_to_all_monitors("存活玩家请自由发言讨论（30秒）");
+                
+                // 打印存活玩家
+                auto alive_players = game.getAlivePlayers();
+                string alive_list = "存活玩家: ";
+                for (int id : alive_players) {
+                    alive_list += to_string(id) + " ";
+                }
+                broadcast_to_all_monitors(alive_list);
+                
+                // 等待30秒讨论时间
+                Sleep(30000);
+                
+                current_game_state = GameState::DAY_VOTING;
+                break;
+            }
+            
+            // ========== 白天-投票放逐 ==========
+            case GameState::DAY_VOTING: {
+                broadcast_to_all_monitors("=== 投票阶段 ===");
+                broadcast_to_all_monitors("请所有存活玩家投票放逐");
+                player_day_votes.clear();
+                
+                auto alive_players = game.getAlivePlayers();
+                for (int voter_id : alive_players) {
+                    string prompt = "玩家" + to_string(voter_id) + "，请投票选择要放逐的玩家ID (";
+                    for (int candidate_id : alive_players) {
+                        prompt += to_string(candidate_id) + " ";
+                    }
+                    prompt += "): ";
+                    send_to_player(voter_id, prompt);
+                    
+                    int vote = receive_choice_from_player(voter_id);
+                    if (vote > 0 && game.isPlayerAlive(vote)) {
+                        player_day_votes[voter_id] = vote;
+                        broadcast_to_all_monitors("玩家" + to_string(voter_id) + "已投票");
+                    }
+                }
+                
+                current_game_state = GameState::VOTE_RESOLVE;
+                break;
+            }
+            
+            // ========== 投票结算 ==========
+            case GameState::VOTE_RESOLVE: {
+                broadcast_to_all_monitors("=== 投票结算 ===");
+                
+                // 统计投票
+                map<int, int> vote_count;
+                for (auto& vote : player_day_votes) {
+                    vote_count[vote.second]++;
+                    broadcast_to_all_monitors("玩家" + to_string(vote.first) + "投给了" + to_string(vote.second));
+                }
+                
+                // 找出最高票
+                int max_votes = 0;
+                int eliminated_player = -1;
+                bool is_tie = false;
+                
+                for (auto& vc : vote_count) {
+                    if (vc.second > max_votes) {
+                        max_votes = vc.second;
+                        eliminated_player = vc.first;
+                        is_tie = false;
+                    } else if (vc.second == max_votes && vc.first != eliminated_player) {
+                        is_tie = true;
+                    }
+                }
+                
+                if (is_tie) {
+                    broadcast_to_all_monitors("投票平局，今天无人出局");
+                } else if (eliminated_player != -1) {
+                    game.eliminatePlayer(eliminated_player);
+                    broadcast_to_all_monitors("投票结果：" + to_string(eliminated_player) + "号玩家被放逐");
+                    
+                    // 检查是否是猎人
+                    const auto& player = game.getPlayer(eliminated_player);
+                    if (player.role == RoleType::HUNTER) {
+                        hunter_needs_shoot = true;
+                        night_dead_player = eliminated_player;
+                    }
+                }
+                
+                Sleep(3000);
+                
+                // 检查游戏是否结束
+                if (game.isGameOver()) {
+                    current_game_state = GameState::GAME_OVER;
+                } else if (hunter_needs_shoot) {
+                    current_game_state = GameState::DAY_HUNTER_SHOOT;
+                } else {
+                    current_game_state = GameState::NIGHT_WEREWOLF;
+                }
+                break;
+            }
+            
+            // ========== 游戏结束 ==========
+            case GameState::GAME_OVER: {
+                broadcast_to_all_monitors("=== 游戏结束 ===");
+                
+                if (game.getWinningTeam() == Team::VILLAGERS) {
+                    broadcast_to_all_monitors("好人阵营获胜！");
+                } else {
+                    broadcast_to_all_monitors("狼人阵营获胜！");
+                }
+                
+                // 公布所有玩家身份
+                game.printPlayers();
+                
+                // 重置游戏
+                game_initialized = false;
+                current_game_state = GameState::WAITING_FOR_PLAYERS;
+                Sleep(10000);
+                break;
+            }
+        }
+        
+        Sleep(100);  // 短暂延迟，避免CPU占用过高
+    }
+}
+
+// ============================================
+// 在 server.cpp 的 main 函数中添加：
+// thread(game_state_machine).detach();
+// ============================================
+
+int main() {
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2,2),&wsaData);
+
+    SOCKET server_socket = socket(AF_INET,SOCK_STREAM,0);
+
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(8080);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    bind(server_socket,(sockaddr*)&server_addr,sizeof(server_addr));
+    listen(server_socket,5);
+
+    cout << "服务器启动成功...\n";
+
+    thread(game_state_machine).detach();//启动状态机线程    
+    while (true) {
+        ClientUsers clus;
+        clus.skt = accept(server_socket,nullptr,nullptr);
+        clients.push_back(clus);
+
+        thread(handle_client,clients.back().skt,clients.size() - 1).detach();
+    }
+
+    closesocket(server_socket);
+    WSACleanup();
+    return 0;
+}
