@@ -1,0 +1,70 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    
+
+    {
+      "name": "调试服务器",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/SERVER.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": true,
+      "MIMode": "gdb",
+      "miDebuggerPath": "C:/Program Files/mingw64/bin/gdb.exe",  // 根据你的MinGW路径调整
+      "setupCommands": [
+        {
+          "description": "为 gdb 启用整齐打印",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ],
+      "preLaunchTask": "编译服务器"
+    },
+    {
+      "name": "调试客户端",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/CLIENT.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": true,
+      "MIMode": "gdb",
+      "miDebuggerPath": "C:/Program Files/mingw64/bin/gdb.exe",
+      "setupCommands": [
+        {
+          "description": "为 gdb 启用整齐打印",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ],
+      "preLaunchTask": "编译客户端"
+    },
+    {
+      "name": "调试监控客户端",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/CLIENT_MONITOR.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": true,
+      "MIMode": "gdb",
+      "miDebuggerPath": "C:/Program Files/mingw64/bin/gdb.exe",
+      "setupCommands": [
+        {
+          "description": "为 gdb 启用整齐打印",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ],
+      "preLaunchTask": "编译监控客户端"
+    }
+  ]
+}
