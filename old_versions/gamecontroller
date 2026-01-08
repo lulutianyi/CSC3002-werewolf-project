@@ -1,0 +1,642 @@
+#include "GameController.h"
+#include <iostream>
+#include <random>
+#include <algorithm>
+
+namespace WerewolfGame {
+
+    GameController::GameController()
+        : _current_phase(GamePhase::DAY), _game_over(false), _winning_team(Team::VILLAGERS) {
+    }
+
+    void GameController::initializeGame(int player_count, const std::vector<std::string>& player_names) {
+        _players.clear();
+        _votes.clear();
+        _player_votes.clear();
+        _game_over = false;
+        _current_phase = GamePhase::DAY;
+
+        for (int i = 0; i < player_count && i < static_cast<int>(player_names.size()); ++i) {
+            _players.emplace_back(i + 1, player_names[i], i > 0);
+        }
+        assignRoles();
+        std::cout << "Game initialized with " << player_count << " players." << std::endl;
+    }
+
+    void GameController::startGame() {
+        std::cout << "=== WEREWOLF GAME STARTED ===" << std::endl;
+        startNightPhase();
+    }
+
+    void GameController::startNightPhase() {
+        _current_phase = GamePhase::NIGHT;
+        std::cout << "\n=== NIGHT PHASE ===" << std::endl;
+        std::cout << "Night falls... Special roles perform their actions." << std::endl;
+        //重置杀人救人状态
+        _tonight_werewolf_target = -1;
+        _tonight_healed_player = -1;
+        _tonight_poisoned_player = -1;
+        
+
+        processWerewolfActions();
+        processSeerActions();
+        processWitchActions();
+        processHunterActions();
+        resolveNightActions();
+
+        if (!_game_over) {
+            std::cout << "\nDawn breaks..." << std::endl;
+            startDayPhase();
+        }
+    }
+    void GameController::startDayPhase() {
+        _current_phase = GamePhase::DAY;
+        resetVotes();
+        std::cout << "=== DAY PHASE ===" << std::endl;
+        printGameStatus();
+    }
+
+    void GameController::processVote(int voter_id, int candidate_id) {
+        if (_current_phase != GamePhase::DAY) {
+            std::cout << "Voting only allowed during day phase." << std::endl;
+            return;
+        }
+
+        if (!isPlayerAlive(voter_id) || !isPlayerAlive(candidate_id)) {
+            std::cout << "Invalid vote: voter or candidate not alive." << std::endl;
+            return;
+        }
+
+        _player_votes[voter_id] = candidate_id;
+        _votes[candidate_id]++;
+
+        std::cout << "Player " << voter_id << " voted for Player " << candidate_id << std::endl;
+
+        if (allPlayersVoted()) {
+            processVoteResult();
+        }
+    }
+
+    void GameController::processAIVotes() {
+        auto alive_players = getAlivePlayers();
+        if (alive_players.size() <= 1) return;
+
+        for (size_t i = 1; i < alive_players.size(); ++i) {
+            int voter_id = alive_players[i];
+
+            if (_player_votes.find(voter_id) != _player_votes.end()) {
+                continue;
+            }
+
+            int candidate_id;
+            do {
+                candidate_id = alive_players[rand() % alive_players.size()];
+            } while (candidate_id == voter_id);
+
+            processVote(voter_id, candidate_id);
+        }
+    }
+
+    void GameController::printGameStatus() const {
+        std::cout << "\n=== GAME STATUS ===" << std::endl;
+        std::cout << "Phase: " << (_current_phase == GamePhase::DAY ? "DAY" : "NIGHT") << std::endl;
+        std::cout << "Game Over: " << (_game_over ? "Yes" : "No") << std::endl;
+
+        if (_game_over) {
+            std::cout << "Winning Team: " << (_winning_team == Team::VILLAGERS ? "Villagers" : "Werewolves") << std::endl;
+        }
+
+        std::cout << "Alive players: ";
+        auto alive_players = getAlivePlayers();
+        for (int player_id : alive_players) {
+            std::cout << "P" << player_id << " ";
+        }
+        std::cout << std::endl;
+
+        if (_current_phase == GamePhase::DAY && !_votes.empty()) {
+            std::cout << "Current votes: ";
+            for (const auto& vote : _votes) {
+                std::cout << "P" << vote.first << "(" << vote.second << " votes) ";
+            }
+            std::cout << std::endl;
+        }
+    }
+
+    void GameController::printPlayers() const {
+        std::cout << "\n=== PLAYER LIST ===" << std::endl;
+        for (const auto& player : _players) {
+            std::string role_name = "Unknown";
+            switch (player.role) {
+            case RoleType::VILLAGER: role_name = "Villager"; break;
+            case RoleType::WEREWOLF: role_name = "Werewolf"; break;
+            case RoleType::SEER: role_name = "Seer"; break;
+            case RoleType::WITCH: role_name = "Witch"; break;
+            case RoleType::HUNTER: role_name = "Hunter"; break;
+            }
+
+            std::cout << "Player " << player.id << ": " << player.name
+                << " [" << role_name << "] "
+                << (player.status == PlayerStatus::ALIVE ? "(Alive)" : "(Dead)") << std::endl;
+        }
+    }
+
+    // ˽�з���ʵ��
+    void GameController::assignRoles() {
+        std::vector<RoleType> roles = generateRoleSetup(static_cast<int>(_players.size()));
+        for (size_t i = 0; i < _players.size() && i < roles.size(); ++i) {
+            _players[i].role = roles[i];
+            _players[i].team = (roles[i] == RoleType::WEREWOLF ? Team::WEREWOLVES : Team::VILLAGERS);
+        }
+    }
+
+    std::vector<RoleType> GameController::generateRoleSetup(int player_count) const {
+        std::vector<RoleType> roles;
+
+        int werewolf_count = GameConstants::DEFAULT_WEREWOLF_COUNT;
+        int villager_count = GameConstants::DEFAULT_VILLAGER_COUNT;
+
+        if (player_count > 8) {
+            werewolf_count = 3;
+            villager_count = player_count - werewolf_count - 3;
+        }
+
+        for (int i = 0; i < werewolf_count; ++i) roles.push_back(RoleType::WEREWOLF);
+        for (int i = 0; i < villager_count; ++i) roles.push_back(RoleType::VILLAGER);
+        roles.push_back(RoleType::SEER);
+        roles.push_back(RoleType::WITCH);
+        roles.push_back(RoleType::HUNTER);
+
+        std::random_device rd;
+        std::mt19937 g(rd());
+        std::shuffle(roles.begin(), roles.end(), g);
+
+        return roles;
+    }
+
+    bool GameController::isPlayerAlive(int player_id) const {
+        for (const auto& player : _players) {
+            if (player.id == player_id && player.status == PlayerStatus::ALIVE) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::vector<int> GameController::getAlivePlayers() const {
+        std::vector<int> alive;
+        for (const auto& player : _players) {
+            if (player.status == PlayerStatus::ALIVE) {
+                alive.push_back(player.id);
+            }
+        }
+        return alive;
+    }
+
+    bool GameController::allPlayersVoted() const {
+        auto alive_players = getAlivePlayers();
+        for (int player_id : alive_players) {
+            if (_player_votes.find(player_id) == _player_votes.end()) {
+                return false;
+            }
+        }
+        return !alive_players.empty();
+    }
+
+    void GameController::processVoteResult() {
+        if (_votes.empty()) {
+            std::cout << "No votes cast." << std::endl;
+            return;
+        }
+
+        VoteResult result;
+        for (const auto& vote : _votes) {
+            if (vote.second > result.vote_count) {
+                result.candidate_id = vote.first;
+                result.vote_count = vote.second;
+                result.is_tie = false;
+            }
+            else if (vote.second == result.vote_count && vote.first != result.candidate_id) {
+                result.is_tie = true;
+            }
+        }
+
+        if (result.is_tie) {
+            std::cout << "Vote result: TIE! No one is eliminated." << std::endl;
+        }
+        else if (result.candidate_id != GameConstants::INVALID_PLAYER_ID) {
+            bool is_hunter = false;
+            for (const auto& player : _players) {
+                if (player.id == result.candidate_id && player.role == RoleType::HUNTER ){
+                    is_hunter = true;
+                    break;
+                }
+            }
+            eliminatePlayer(result.candidate_id);
+            std::cout << "Vote result: Player " << result.candidate_id << " is eliminated!" << std::endl;
+            checkGameOver();
+            if (is_hunter){
+                processHunterShoot( result.candidate_id);
+            }
+        }
+        
+
+        if (!_game_over) {
+            startNightPhase();
+        }
+    }
+
+    void GameController::eliminatePlayer(int player_id) {
+        for (auto& player : _players) {
+            if (player.id == player_id) {
+                player.status = PlayerStatus::DEAD;
+                break;
+            }
+        }
+    }
+
+    
+
+    void GameController::processWerewolfActions() {
+        auto alive_players = getAlivePlayers();
+        if (alive_players.size() <= 1) return;
+        std::cout << "Werewolves are choosing their target player..." << std::endl;
+        std::vector<int> werewolves;
+        for (const auto& player : _players) {
+            if (player.status == PlayerStatus::ALIVE && player.role == RoleType::WEREWOLF) {
+                werewolves.push_back(player.id);
+            }
+        }
+
+        if (!werewolves.empty()) {
+            std::vector<int> potential_targets;
+            for (const auto& player : _players) {
+                if (player.status == PlayerStatus::ALIVE && player.role != RoleType::WEREWOLF) {
+                    potential_targets.push_back(player.id);
+                    
+                }
+            }
+
+            if (!potential_targets.empty()) {
+                _tonight_werewolf_target = potential_targets[rand()% potential_targets.size()];
+                std::cout << "Werewolves have chosen their target player yet..." << std::endl; // AI狼人选择目标
+            }
+        }
+    }
+
+    void GameController::processSeerActions(){
+        for (const auto& player : _players) {
+            if (player.status == PlayerStatus::ALIVE && player.role == RoleType::SEER) {
+                if (player.is_ai) {
+                // AI预言家自动查验
+                    processAISeerCheck(player.id);
+                } else {
+                // 人类预言家 - 等待玩家输入（通过命令）
+                    std::cout << "Seer (Player " << player.id << ") can check a player's role." << std::endl;
+                    std::cout << "Enter the player ID you want to check: " << std::endl;
+                    int target_id;
+                    std::cin >> target_id;
+                    performSeerCheck(player.id, target_id);
+                }
+                
+                break; // 只有一个预言家
+            }
+        }
+    }
+
+    void GameController::processAISeerCheck(int seer_id) {
+    std::cout<< "=====Seer's turn====="<< std::endl;
+    std::cout << "Seer is checking someone's identity..." << std::endl;
+    
+    // 获取所有存活且未被查验过的玩家（除了自己）
+    std::vector<int> available_targets;
+    for (const auto& player : _players) {
+        if (player.id != seer_id && 
+            player.status == PlayerStatus::ALIVE &&
+            !hasPlayerBeenChecked(player.id)) {
+            available_targets.push_back(player.id);
+        }
+    }
+    
+    if (available_targets.empty()) {
+        std::cout << "No one left to check." << std::endl;
+        return;
+    }
+    
+    // 简单策略：随机选择，但倾向于查验存活时间长的玩家
+    int target_id;
+    
+    // 策略：优先查验存活玩家中ID较小的（假设游戏早期存活）
+    if (rand() % 100 < 70) { // 70%概率选择ID较小的玩家
+        target_id = *std::min_element(available_targets.begin(), available_targets.end());
+    } else { // 30%概率随机选择
+        target_id = available_targets[rand() % available_targets.size()];
+    }
+    
+    performSeerCheck(seer_id, target_id);
+}
+
+
+void GameController::performSeerCheck(int seer_id, int target_id) {
+    // 验证目标玩家
+    if (target_id < 0 || target_id >= _players.size()) {
+        std::cout << "Invalid player ID." << std::endl;
+        return;
+    }
+
+    const auto& target = _players[target_id];
+    if (target.status != PlayerStatus::ALIVE) {
+        std::cout << "Player " << target_id << " is dead." << std::endl;
+        return;
+    }
+
+    if (hasPlayerBeenChecked(target_id)) {
+        std::cout << "Player " << target_id << " has already been checked." << std::endl;
+        return;
+    }
+      std::string role_name;
+    switch (target.role) {
+        case RoleType::VILLAGER: role_name = "VILLAGER"; break;
+        case RoleType::WEREWOLF: role_name = "WEREWOLF"; break;
+        case RoleType::WITCH: role_name = "WITCH"; break;
+        case RoleType::HUNTER: role_name = "HUNTER"; break;
+        case RoleType::SEER: role_name = "SEER"; break;
+        default: role_name = "UNKNOWN"; break;
+    }
+
+    
+    
+    _seer_check_records.push_back(SeerCheckRecord(target_id, target.role));
+}
+
+
+
+
+bool GameController::hasPlayerBeenChecked(int player_id) const {
+    // 检查预言家查验历史记录
+    for (const auto& check_record : _seer_check_records) {
+        if (check_record.target_id == player_id) {
+            return true;  // 这个玩家已经被查验过
+        }
+    }
+    return false;  // 这个玩家未被查验过
+}
+
+    void GameController::processWitchActions(){
+        for (const auto& player : _players) {
+            if (player.status == PlayerStatus::ALIVE && player.role == RoleType::WITCH) {
+                if (player.is_ai) {
+                    processAIWitch(player.id);
+                } else {
+                // 人类女巫 - 通过命令输入
+                    handleHumanWitchActions();
+                }
+                break;
+            }
+
+        }
+    }
+    void GameController::handleHumanWitchActions() {
+        std::cout << "=====Witch's turn=====" << std::endl;
+        if (_tonight_healed_player == -1 && _tonight_poisoned_player == -1){
+            std::cout << "You have a heal potion and a poison." << std::endl;
+        }
+        if (_tonight_werewolf_target != -1) {
+            std::cout << "The werewolves targeted Player " << _tonight_werewolf_target << " tonight." << std::endl;
+            if(_tonight_healed_player == -1){
+                std::cout << "Do you want to use your heal potion on Player " << _tonight_werewolf_target << "? (y/n)" << std::endl;
+                std::string _heal_choice;
+                std::cin >> _heal_choice;
+                if (_heal_choice == "y"){
+                    _tonight_healed_player = _tonight_werewolf_target;
+                    std::cout << "You have healed Player " << _tonight_healed_player << "." << std::endl;
+                    //解药用过了
+                }
+                else{
+                    std::cout << "You refused to save that poor guy." << std::endl;
+                }
+            }
+            else{
+                std::cout << "You have used your heal potion." << std::endl;
+            }
+           
+        }
+        else{
+            std::cout << "The werewolves did not target anyone tonight." << std::endl;
+        }
+        if (_tonight_poisoned_player == -1){
+            std::cout << "Do you want to use your poison on a player? (y/n)" << std::endl;
+            std::string _poison_choice;
+            std::cin >> _poison_choice;
+            if (_poison_choice == "y"){
+                std::cout << "Which player do you want to poison? (enter player id)" << std::endl;
+                int _poison_ID;
+                std::cin >> _poison_ID;
+                if (_poison_ID < 1 || _poison_ID > _players.size()){
+                    std::cout << "Invalid player id." << std::endl;
+                }
+                else{
+                    _tonight_poisoned_player = _poison_ID;
+                    std::cout << "You have poisoned Player " << _tonight_poisoned_player << "." << std::endl;
+                }
+            }
+            else{
+                std::cout << "You refused to use your poison." << std::endl;
+            }
+        }
+
+    }
+
+    void GameController::processAIWitch(int witch_id) {
+    std::cout << "Witch  is considering potions..." << std::endl;
+    
+    bool can_heal = (_tonight_healed_player == -1);
+    bool can_poison = (_tonight_poisoned_player == -1);
+    
+    // 1. 自救永远是第一优先级
+    if (can_heal && _tonight_werewolf_target == witch_id) {
+        _tonight_healed_player = witch_id;
+        return;
+    }
+    
+    // 2. 解药使用策略
+    if (can_heal && _tonight_werewolf_target != -1) {
+        bool should_heal = false;
+        
+        // 策略1：游戏早期尽量救人（前3晚）
+        static int night_count = 0;
+        night_count++;
+        if (night_count <= 3 && rand() % 100 < 80) { // 前3晚80%概率救人
+            should_heal = true;
+        }
+        
+        
+        if (should_heal) {
+            _tonight_healed_player = _tonight_werewolf_target;
+            
+            return;
+        }
+    }
+    
+    // 3. 毒药使用策略
+    if (can_poison) {
+        // 简单策略：毒一个随机存活玩家（除了自己）
+        std::vector<int> poison_targets;
+        for (const auto& player : _players) {
+            if (player.id != witch_id && player.status == PlayerStatus::ALIVE) {
+                poison_targets.push_back(player.id);
+            }
+        }
+        
+        if (!poison_targets.empty() && rand() % 100 < 40) { // 40%概率使用毒药
+            int target_id = poison_targets[rand() % poison_targets.size()];
+            _tonight_poisoned_player = target_id;
+            
+            return;
+        }
+    }
+    
+    
+}
+
+    void GameController::processHunterActions(){
+        std::cout << "=====Hunter's turn=====" << std::endl;
+        for (const auto& player : _players) {
+            if (player.status == PlayerStatus::ALIVE && player.role == RoleType::HUNTER) {
+                
+                // 猎人 - 检查开枪状态
+                if (player.id != _tonight_poisoned_player){
+                    std::cout << "Your gun hasn't been poisoned and is ready to shot" << std::endl;
+                    
+                }
+                else{
+                    std::cout << "Your gun has been poisoned and cannot be used" << std::endl;
+                }
+                break;
+            }
+
+        }
+    }
+
+    void GameController::resolveNightActions() {
+    // 处理死亡结果
+        int dead_player_id = -1;
+    
+    // 狼人杀人是否生效（未被女巫救）
+        if (_tonight_werewolf_target != -1 && 
+            _tonight_werewolf_target != _tonight_healed_player) {
+                eliminatePlayer(_tonight_werewolf_target);
+                std::cout << "Player " << _tonight_werewolf_target << " was killed by werewolves!" << std::endl;
+                dead_player_id = _tonight_werewolf_target;
+        }
+    
+    // 女巫毒杀
+        if (_tonight_poisoned_player != -1) {
+            eliminatePlayer(_tonight_poisoned_player);
+            std::cout << "Player " << _tonight_poisoned_player << " was poisoned!" << std::endl;
+            dead_player_id = _tonight_poisoned_player;
+        }
+        if(dead_player_id != -1) {
+        // 检查这个将死的玩家是不是猎人
+            bool is_hunter = false;
+            for (const auto& player : _players) {
+                if (player.id == dead_player_id && player.role == RoleType::HUNTER && player.status == PlayerStatus::ALIVE) {
+                    is_hunter = true;
+                    break;
+                }
+            }
+        
+        
+            if (is_hunter) {
+            // 猎人死亡，检查死亡原因
+                bool was_poisoned = (dead_player_id == _tonight_poisoned_player);
+            
+                if (!was_poisoned) {
+                // 猎人非毒杀死亡，可以开枪
+                    processHunterShoot(dead_player_id);
+                } else {
+                // 猎人被毒杀，不能开枪
+                }
+            }
+        }
+        
+    
+        if (dead_player_id == -1) {
+            std::cout << "It was a peaceful night. No one died." << std::endl;
+        }
+    
+        checkGameOver();
+    }
+    void GameController::processHunterShoot(int dead_hunter_id) {
+    // 找到这个猎人玩家
+    for (const auto& player : _players) {
+        if (player.id == dead_hunter_id && player.role == RoleType::HUNTER) {
+            if (player.is_ai) {
+                // AI猎人开枪
+                std::vector<int> available_targets;
+                for (const auto& p : _players) {
+                    if (p.id != dead_hunter_id && p.status == PlayerStatus::ALIVE) {
+                        available_targets.push_back(p.id);
+                    }
+                }
+                
+                if (!available_targets.empty()) {
+                    int target_id = available_targets[rand() % available_targets.size()];
+                    eliminatePlayer(target_id);
+                    std::cout << "💥 Hunter shot Player " << target_id << " from the grave!" << std::endl;
+                    checkGameOver();
+                }
+            } else {
+                // 人类猎人开枪
+                std::cout << "Choose a player to shoot (enter ID): ";
+                int target_id;
+                std::cin >> target_id;
+                
+                if (target_id >= 1 && target_id <= static_cast<int>(_players.size()) && 
+                    target_id != dead_hunter_id && isPlayerAlive(target_id)) {
+                    eliminatePlayer(target_id);
+                    std::cout << "💥 Hunter shot Player " << target_id << " from the grave!" << std::endl;
+                    checkGameOver();
+                } else {
+                    std::cout << "Invalid target! Hunter decided not to shoot." << std::endl;
+                }
+            }
+            break;
+        }
+    }
+}
+
+    void GameController::checkGameOver() {
+        int alive_villagers = 0;
+        int alive_werewolves = 0;
+
+        for (const auto& player : _players) {
+            if (player.status == PlayerStatus::ALIVE) {
+                if (player.team == Team::VILLAGERS) {
+                    alive_villagers++;
+                }
+                else {
+                    alive_werewolves++;
+                }
+            }
+        }
+
+        if (alive_werewolves == 0) {
+            _game_over = true;
+            _winning_team = Team::VILLAGERS;
+            std::cout << "\n=== GAME OVER ===" << std::endl;
+            std::cout << "Villagers win! All werewolves have been eliminated." << std::endl;
+        }
+        else if (alive_werewolves >= alive_villagers) {
+            _game_over = true;
+            _winning_team = Team::WEREWOLVES;
+            std::cout << "\n=== GAME OVER ===" << std::endl;
+            std::cout << "Werewolves win! They outnumber the villagers." << std::endl;
+        }
+    }
+
+    void GameController::resetVotes() {
+        _votes.clear();
+        _player_votes.clear();
+    }
+
+} // namespace WerewolfGame
